@@ -1,0 +1,283 @@
+"""
+VR-Data-Science-for-Exposure-Therapy-Analysis
+Synthetic dataset generation (>500 samples), EDA, basic modeling (classification + regression),
+and export of CSV + visualizations.
+
+Save as: vr_exposure_analysis.py
+Requires: numpy, pandas, scikit-learn, matplotlib, seaborn
+Install: pip install numpy pandas scikit-learn matplotlib seaborn
+"""
+
+import os
+import random
+from pathlib import Path
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix,
+    mean_squared_error, r2_score
+)
+
+# ------------------ Settings ------------------
+RANDOM_SEED = 42
+NUM_PARTICIPANTS = 150
+SESSIONS_PER_PARTICIPANT = 4   # average sessions each
+NUM_SAMPLES = NUM_PARTICIPANTS * SESSIONS_PER_PARTICIPANT  # 600 samples
+OUTPUT_CSV = "vr_exposure_synthetic.csv"
+PLOTS_DIR = Path("plots")
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+# ------------------ Synthetic data design ------------------
+# Features to simulate:
+# - ParticipantID, Age, Gender
+# - BaselineAnxiety (0-100), BaselineSUDS (0-10)
+# - SessionNumber (1..n), Environment (phobia type), ExposureIntensity (0-1)
+# - AvgHeartRate (bpm), PeakHeartRate, GSR_mean, GSR_peak
+# - HeadRotationMean, HeadRotationStd (degrees)
+# - TimeInHotzone (seconds), TasksCompleted (0..5)
+# - TherapistPresent (Yes/No), SessionDuration (sec)
+# - SelfReportedSUDS_post (0-10), AnxietyScore_post (0-100)
+# - ImprovementBinary (1 if clinically meaningful improvement), ImprovementDelta (baseline - post)
+
+environments = [
+    "Heights", "Crowds", "PublicSpeaking", "ClosedSpaces", "Animals", "Driving", "SocialInteraction"
+]
+genders = ["Male", "Female", "Other"]
+
+def generate_participant(part_id):
+    """Generate stable participant-level attributes."""
+    age = int(np.clip(np.random.normal(34, 12), 18, 75))
+    gender = random.choices(genders, weights=[0.48, 0.48, 0.04])[0]
+    baseline_anxiety = float(np.clip(np.random.normal(65 - (age-30)*0.2, 12), 20, 95))
+    baseline_suds = float(np.clip((baseline_anxiety / 10.0) + np.random.normal(0, 1.2), 0, 10))
+    trait_sensitivity = float(np.clip(np.random.beta(2, 4) * 1.5, 0.05, 1.0))  # participant sensitivity multiplier
+    return {"ParticipantID": f"P{1000+part_id}", "Age": age, "Gender": gender,
+            "BaselineAnxiety": round(baseline_anxiety, 1),
+            "BaselineSUDS": round(baseline_suds, 1),
+            "TraitSensitivity": round(trait_sensitivity, 3)}
+
+rows = []
+start_date = datetime.now() - timedelta(days=300)
+
+for pid in range(NUM_PARTICIPANTS):
+    p = generate_participant(pid)
+    # assign a favored environment per participant (simulate targeted therapy)
+    fav_env = random.choice(environments)
+    for session in range(1, SESSIONS_PER_PARTICIPANT + 1):
+        # session-level variables
+        env = fav_env if random.random() < 0.75 else random.choice(environments)
+        exposure_intensity = float(np.clip(np.random.beta(2 + session*0.2, 3 - session*0.05) , 0.05, 0.99))
+        therapist_present = random.random() < 0.85
+        session_duration = int(np.clip(np.random.normal(900 + session*20, 120), 300, 1800))  # seconds
+        time_in_hotzone = int(np.clip(session_duration * exposure_intensity * np.random.uniform(0.4, 0.95), 10, session_duration))
+        tasks_completed = int(np.clip(np.random.poisson(2 + session*0.2), 0, 6))
+        # physiological signals (simulate increases proportional to exposure and trait sensitivity)
+        hr_baseline = 60 + (p["Age"] - 30)*0.2 + np.random.normal(0, 3)
+        avg_hr = hr_baseline + (exposure_intensity * 25 * p["TraitSensitivity"]) + np.random.normal(0, 5)
+        peak_hr = max(avg_hr + np.random.normal(8, 6), avg_hr + 3)
+        gsr_mean = float(np.clip(0.2 + exposure_intensity * 2.5 * p["TraitSensitivity"] + np.random.normal(0, 0.15), 0.05, 6.0))
+        gsr_peak = float(np.clip(gsr_mean + abs(np.random.normal(0.4, 0.3)), 0.1, 10.0))
+        head_rot_mean = float(np.clip(np.random.normal(10 + exposure_intensity*30, 8), 0, 120))
+        head_rot_std = float(np.clip(np.random.normal(5 + exposure_intensity*8, 3), 0.5, 60))
+        # immediate subjective distress after session
+        suds_post = float(np.clip(p["BaselineSUDS"] * (1 - 0.08*session) + (exposure_intensity * 2.5) * p["TraitSensitivity"]
+                                  + np.random.normal(0, 0.9), 0, 10))
+        anxiety_post = float(np.clip(p["BaselineAnxiety"] * (1 - 0.07*session) + exposure_intensity * 8 * p["TraitSensitivity"]
+                                     + np.random.normal(0, 6), 0, 100))
+        # improvement metrics (delta)
+        improvement_delta = p["BaselineAnxiety"] - anxiety_post
+        # mark clinically meaningful improvement if delta >= 10 points OR percentage reduction >= 15%
+        improved_binary = int((improvement_delta >= 10) or (improvement_delta / max(1.0, p["BaselineAnxiety"]) >= 0.15))
+        # session timestamp
+        session_date = start_date + timedelta(days=random.randint(0, 300), hours=random.randint(0,23), minutes=random.randint(0,59))
+        rows.append({
+            "ParticipantID": p["ParticipantID"],
+            "SessionDate": session_date.isoformat(sep=' '),
+            "Age": p["Age"],
+            "Gender": p["Gender"],
+            "BaselineAnxiety": p["BaselineAnxiety"],
+            "BaselineSUDS": p["BaselineSUDS"],
+            "Environment": env,
+            "SessionNumber": session,
+            "ExposureIntensity": round(exposure_intensity, 3),
+            "TherapistPresent": "Yes" if therapist_present else "No",
+            "SessionDuration_sec": session_duration,
+            "TimeInHotzone_sec": time_in_hotzone,
+            "TasksCompleted": tasks_completed,
+            "AvgHeartRate_bpm": round(avg_hr, 1),
+            "PeakHeartRate_bpm": round(peak_hr, 1),
+            "GSR_mean_uS": round(gsr_mean, 3),
+            "GSR_peak_uS": round(gsr_peak, 3),
+            "HeadRotationMean_deg": round(head_rot_mean, 2),
+            "HeadRotationStd_deg": round(head_rot_std, 2),
+            "SUDS_post": round(suds_post, 2),
+            "AnxietyScore_post": round(anxiety_post, 1),
+            "ImprovementDelta": round(improvement_delta, 2),
+            "ImprovedBinary": improved_binary
+        })
+
+# ------------------ Create DataFrame and save CSV ------------------
+df = pd.DataFrame(rows)
+df.to_csv(OUTPUT_CSV, index=False)
+print(f"Synthetic dataset saved to: {Path(OUTPUT_CSV).resolve()}")
+print("Dataset shape:", df.shape)
+print(df["ImprovedBinary"].value_counts(normalize=True).round(3))
+
+# ------------------ Exploratory Visuals ------------------
+sns.set(style="whitegrid", context="notebook")
+
+# 1) Distribution of baseline anxiety
+plt.figure(figsize=(8,4))
+sns.histplot(df["BaselineAnxiety"], bins=25, kde=True)
+plt.title("Baseline Anxiety Distribution")
+plt.xlabel("Baseline Anxiety (0-100)")
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "baseline_anxiety_distribution.png")
+plt.close()
+
+# 2) Post-session anxiety by session number
+plt.figure(figsize=(8,5))
+sns.boxplot(x="SessionNumber", y="AnxietyScore_post", data=df)
+plt.title("Post-session Anxiety by Session Number")
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "anxiety_by_session.png")
+plt.close()
+
+# 3) AvgHeartRate vs ExposureIntensity (sampled scatter)
+plt.figure(figsize=(8,5))
+sns.scatterplot(x="ExposureIntensity", y="AvgHeartRate_bpm", hue="ImprovedBinary", data=df, alpha=0.6)
+plt.title("Avg Heart Rate vs Exposure Intensity (colored by improvement)")
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "hr_vs_exposure.png")
+plt.close()
+
+# 4) Improvement rate by environment
+plt.figure(figsize=(9,5))
+impr_by_env = df.groupby("Environment")["ImprovedBinary"].mean().sort_values(ascending=False)
+sns.barplot(x=impr_by_env.index, y=impr_by_env.values)
+plt.xticks(rotation=45)
+plt.ylabel("Improvement Rate (fraction)")
+plt.title("Improvement Rate by VR Environment")
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "improvement_by_environment.png")
+plt.close()
+
+print(f"Saved plots to {PLOTS_DIR.resolve()}")
+
+# ------------------ Modeling ------------------
+# We'll do:
+# - Classification: predict ImprovedBinary (did the session produce meaningful improvement)
+# - Regression: predict AnxietyScore_post (continuous)
+
+# Prepare features (simple encoding)
+feature_cols = [
+    "Age", "BaselineAnxiety", "BaselineSUDS", "SessionNumber",
+    "ExposureIntensity", "SessionDuration_sec", "TimeInHotzone_sec",
+    "TasksCompleted", "AvgHeartRate_bpm", "PeakHeartRate_bpm", "GSR_mean_uS",
+    "GSR_peak_uS", "HeadRotationMean_deg", "HeadRotationStd_deg"
+]
+# Encode categorical environment using one-hot
+env_dummies = pd.get_dummies(df["Environment"], prefix="Env")
+ther_dummies = pd.get_dummies(df["TherapistPresent"], prefix="Ther")
+gender_dummies = pd.get_dummies(df["Gender"], prefix="Gender")
+
+X = pd.concat([df[feature_cols], env_dummies, ther_dummies, gender_dummies], axis=1)
+y_class = df["ImprovedBinary"].values
+y_reg = df["AnxietyScore_post"].values
+
+# Train/test split
+X_train, X_test, y_train_cl, y_test_cl, y_train_reg, y_test_reg = train_test_split(
+    X, y_class, y_reg, test_size=0.25, random_state=RANDOM_SEED, stratify=y_class
+)
+
+# Standardize numeric features for regression (RandomForest insensitive but good practice)
+num_cols = feature_cols
+scaler = StandardScaler()
+X_train_scaled = X_train.copy()
+X_test_scaled = X_test.copy()
+X_train_scaled[num_cols] = scaler.fit_transform(X_train[num_cols])
+X_test_scaled[num_cols] = scaler.transform(X_test[num_cols])
+
+# Classification model
+clf = RandomForestClassifier(n_estimators=200, random_state=RANDOM_SEED, n_jobs=-1)
+clf.fit(X_train_scaled, y_train_cl)
+y_pred_cl = clf.predict(X_test_scaled)
+acc = accuracy_score(y_test_cl, y_pred_cl)
+print("\nClassification (ImprovedBinary) Results:")
+print(f"Accuracy: {acc:.3f}")
+print(classification_report(y_test_cl, y_pred_cl, digits=3))
+cm = confusion_matrix(y_test_cl, y_pred_cl)
+print("Confusion matrix:\n", cm)
+
+# Save classification feature importances
+feat_imp = pd.Series(clf.feature_importances_, index=X.columns).sort_values(ascending=False).head(20)
+plt.figure(figsize=(8,6))
+sns.barplot(x=feat_imp.values, y=feat_imp.index)
+plt.title("Top 20 Feature Importances (Classification RF)")
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "feat_importance_classification.png")
+plt.close()
+
+# Regression model
+reg = RandomForestRegressor(n_estimators=200, random_state=RANDOM_SEED, n_jobs=-1)
+reg.fit(X_train_scaled, y_train_reg)
+y_pred_reg = reg.predict(X_test_scaled)
+mse = mean_squared_error(y_test_reg, y_pred_reg)
+r2 = r2_score(y_test_reg, y_pred_reg)
+print("\nRegression (AnxietyScore_post) Results:")
+print(f"MSE: {mse:.3f}, RMSE: {np.sqrt(mse):.3f}, R2: {r2:.3f}")
+
+# Save regression feature importances
+feat_imp_reg = pd.Series(reg.feature_importances_, index=X.columns).sort_values(ascending=False).head(20)
+plt.figure(figsize=(8,6))
+sns.barplot(x=feat_imp_reg.values, y=feat_imp_reg.index)
+plt.title("Top 20 Feature Importances (Regression RF)")
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "feat_importance_regression.png")
+plt.close()
+
+# Save a confusion matrix visualize
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix (ImprovedBinary)")
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "confusion_matrix.png")
+plt.close()
+
+# ------------------ Example predictions ------------------
+examples = X_test_scaled.sample(5, random_state=RANDOM_SEED)
+examples_orig_idx = examples.index
+print("\nExample predictions (sample):")
+for idx in examples_orig_idx:
+    rowX = X_test_scaled.loc[idx:idx]
+    pred_cl = clf.predict(rowX)[0]
+    prob_cl = clf.predict_proba(rowX)[0].max()
+    pred_reg = reg.predict(rowX)[0]
+    actual_cl = y_test_cl[list(X_test_scaled.index).index(idx)]
+    actual_reg = y_test_reg[list(X_test_scaled.index).index(idx)]
+    print(f"- Index {idx}: PredImproved={pred_cl} (p~{prob_cl:.2f}) | PredAnxiety={pred_reg:.1f} | TrueImp={actual_cl} | TrueAnx={actual_reg:.1f}")
+
+# ------------------ Save processed features and models (optional) ------------------
+# Save the processed feature CSV for reproducibility / downstream analysis
+processed_csv = "vr_exposure_features_for_modeling.csv"
+X_scaled_full = pd.concat([X_train_scaled, X_test_scaled], axis=0)
+y_full = np.concatenate([y_train_cl, y_test_cl])
+X_scaled_full = X_scaled_full.reset_index(drop=True)
+out_df = X_scaled_full.copy()
+out_df["ImprovedBinary"] = np.concatenate([y_train_cl, y_test_cl])
+out_df.to_csv(processed_csv, index=False)
+print(f"\nSaved processed feature CSV: {Path(processed_csv).resolve()}")
+print("All done. Plots and CSV files are in the repository folder.")
